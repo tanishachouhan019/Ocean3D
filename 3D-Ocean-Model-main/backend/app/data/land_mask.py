@@ -1,0 +1,132 @@
+import os
+import json
+from typing import Tuple, List, Set, Optional, Dict, Any
+import numpy as np
+import scipy.ndimage as ndi
+
+POLYGON_PATH = os.path.join(os.path.dirname(__file__), "arabian_sea_polygon.json")
+
+_OCEAN_POLYGON: Optional[List[List[float]]] = None
+
+def get_arabian_sea_polygon() -> List[List[float]]:
+    """Loads and caches the bundled Natural Earth Arabian Sea ocean polygon."""
+    global _OCEAN_POLYGON
+    if _OCEAN_POLYGON is not None:
+        return _OCEAN_POLYGON
+
+    if not os.path.exists(POLYGON_PATH):
+        raise FileNotFoundError(f"Arabian Sea polygon not found at {POLYGON_PATH}")
+
+    with open(POLYGON_PATH, "r") as f:
+        data = json.load(f)
+    _OCEAN_POLYGON = data["coordinates"][0]
+    return _OCEAN_POLYGON
+
+def point_in_polygon(x: float, y: float, poly: List[List[float]]) -> bool:
+    """
+    Ray casting algorithm to test if point (x=lon, y=lat) is inside polygon.
+    """
+    n = len(poly)
+    inside = False
+    p1x, p1y = poly[0]
+    for i in range(n + 1):
+        p2x, p2y = poly[i % n]
+        if y > min(p1y, p2y):
+            if y <= max(p1y, p2y):
+                if x <= max(p1x, p2x):
+                    if p1y != p2y:
+                        xinters = (y - p1y) * (p2x - p1x) / (p2y - p1y) + p1x
+                    if p1x == p2x or x <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+
+def apply_land_mask(
+    data_4d: np.ndarray,
+    lats: List[float],
+    lons: List[float],
+    fill_values: Optional[Set[float]] = None,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Applies the two-tier land masking pipeline to a 4D array (time, depth, lat, lon).
+
+    Returns:
+    - masked_data_4d: 4D numpy array with NaN over land cells
+    - coastline_alpha: 2D numpy array (lat, lon) with alpha values [0.0, 1.0] ramping over 2-3 cells
+    - diagnostics: Dict with counts of cells masked by primary vs backup methods
+    """
+    if fill_values is None:
+        fill_values = set()
+
+    nlat = len(lats)
+    nlon = len(lons)
+    total_cells = nlat * nlon
+
+    surface_slice = data_4d[0, 0, :, :].copy()
+    primary_mask = np.zeros((nlat, nlon), dtype=bool)
+
+    primary_mask |= ~np.isfinite(surface_slice)
+
+    for fv in fill_values:
+        if fv is not None and np.isfinite(fv):
+            primary_mask |= np.isclose(surface_slice, fv, rtol=1e-4, atol=1e-4)
+
+    primary_mask |= (np.abs(surface_slice) > 1e20)
+
+    primary_masked_count = int(np.sum(primary_mask))
+
+    is_atlantic = any(lon < 0 for lon in lons)
+    poly = None if is_atlantic else get_arabian_sea_polygon()
+    backup_mask = np.zeros((nlat, nlon), dtype=bool)
+
+    for i, lat in enumerate(lats):
+        for j, lon in enumerate(lons):
+            if not primary_mask[i, j]:
+                if is_atlantic:
+                    # Atlantic ocean boundary check
+                    is_land_americas = (lon <= -75.0) or (lat > 25.0 and lon < -80.0 + (lat - 25.0) * 0.5) or (lat < 10.0 and lon < -60.0 + (10.0 - lat) * 1.2)
+                    is_land_africa_europe = (lon >= -15.0 and lat < 36.0) or (lon >= -9.0 and lat >= 36.0)
+                    if is_land_americas or is_land_africa_europe:
+                        backup_mask[i, j] = True
+                else:
+                    is_ocean = point_in_polygon(lon, lat, poly)
+                    if not is_ocean:
+                        backup_mask[i, j] = True
+
+    backup_masked_count = int(np.sum(backup_mask))
+
+    combined_land_mask = primary_mask | backup_mask
+    water_mask = ~combined_land_mask
+    water_count = int(np.sum(water_mask))
+
+    masked_data = data_4d.copy()
+    masked_data[:, :, combined_land_mask] = np.nan
+
+    dist = ndi.distance_transform_edt(water_mask)
+
+    coastline_alpha = np.clip(dist / 2.5, 0.0, 1.0).astype(np.float32)
+    coastline_alpha[combined_land_mask] = 0.0
+
+    diagnostics = {
+        "primary_masked_count": primary_masked_count,
+        "backup_masked_count": backup_masked_count,
+        "total_cells": total_cells,
+        "water_cells": water_count,
+        "land_cells": total_cells - water_count,
+        "land_percentage": round(((total_cells - water_count) / total_cells) * 100.0, 1),
+    }
+
+    print(
+        f"[Land Mask] Total cells: {total_cells} | "
+        f"Primary mask (NaN/_FillValue): {primary_masked_count} | "
+        f"Backup mask (Natural Earth polygon): {backup_masked_count} | "
+        f"Ocean cells: {water_count} ({100.0 - diagnostics['land_percentage']}%)"
+    )
+
+    if backup_masked_count > 50 and primary_masked_count == 0:
+        print(
+            f"[Land Mask Warning] Backup Natural Earth polygon masked {backup_masked_count} cells "
+            "because source NetCDF did not declare _FillValue/missing_value attributes."
+        )
+
+    return masked_data, coastline_alpha, diagnostics
